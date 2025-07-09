@@ -1,0 +1,164 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - '**'
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Add project root to PYTHONPATH
+        run: echo "PYTHONPATH=$(pwd)" >> $GITHUB_ENV
+
+      - name: Run pytest
+        run: pytest --maxfail=1 --disable-warnings -q
+
+  build-image:
+    name: Build & Push Docker Image
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Detect Dockerfile / code changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            docker_changes:
+              - 'Dockerfile'
+              - '*.py'
+              - 'requirements.txt'
+
+      - name: Skip build if no Docker context changed
+        if: steps.filter.outputs.docker_changes == 'false'
+        run: echo "No Docker-related files changed; skipping image build."
+
+      - name: Azure Login
+        if: steps.filter.outputs.docker_changes == 'true'
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Login to ACR
+        if: steps.filter.outputs.docker_changes == 'true'
+        run: az acr login --name ${{ secrets.AZURE_CONTAINER_REGISTRY_NAME }}
+
+      - name: Build & Push image
+        if: steps.filter.outputs.docker_changes == 'true'
+        env:
+          IMAGE_NAME: subnet-analyzer
+        run: |
+          IMAGE="${{ secrets.AZURE_CONTAINER_REGISTRY_NAME }}.azurecr.io/${IMAGE_NAME}:latest"
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+
+  deploy-infra:
+    name: Deploy Infrastructure
+    needs: [test, build-image]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./terraform
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Bootstrap backend resources
+        env:
+          AZURE_LOCATION: ${{ secrets.AZURE_LOCATION }}
+        run: |
+          RG="${{ secrets.AZURE_RESOURCE_GROUP }}"
+          SA="${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}"
+          CT="tfstate"
+          LOC="$AZURE_LOCATION"
+
+          # Ensure Resource Group exists
+          az group create --name "$RG" --location "$LOC" >/dev/null
+
+          # Create Storage Account if missing
+          if ! az storage account show --resource-group "$RG" --name "$SA" >/dev/null 2>&1; then
+            az storage account create \
+              --resource-group "$RG" \
+              --name "$SA" \
+              --sku Standard_LRS \
+              --kind StorageV2
+          fi
+
+          # Wait for storage account provisioning to complete
+          echo "Waiting for storage account provisioning..."
+          until [ "$(az storage account show --resource-group "$RG" --name "$SA" --query provisioningState -o tsv)" = "Succeeded" ]; do
+            sleep 5
+          done
+
+          # Create tfstate container
+          ACCOUNT_KEY=$(az storage account keys list --resource-group "$RG" --account-name "$SA" --query "[0].value" -o tsv)
+          az storage container create --name "$CT" --account-name "$SA" --account-key "$ACCOUNT_KEY"
+
+          # Export key for Terraform
+          echo "ACCOUNT_KEY=$ACCOUNT_KEY" >> $GITHUB_ENV
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: '1.5.0'
+
+      - name: Configure Terraform variables
+        run: |
+          echo "TF_VAR_subscription_id=${{ secrets.AZURE_SUBSCRIPTION_ID }}" >> $GITHUB_ENV
+          echo "TF_VAR_tenant_id=${{ secrets.AZURE_TENANT_ID }}" >> $GITHUB_ENV
+
+      - name: Terraform Init (remote state)
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ secrets.AZURE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=subnet-analyzer/terraform.tfstate" \
+            -backend-config="access_key=$ACCOUNT_KEY"
+
+      - name: Import existing backend resources into state
+        run: |
+          if ! terraform state list | grep -q '^azurerm_resource_group\.rg$'; then
+            terraform import -input=false azurerm_resource_group.rg "/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/${{ secrets.AZURE_RESOURCE_GROUP }}"
+          fi
+          if ! terraform state list | grep -q '^azurerm_storage_account\.sa$'; then
+            terraform import -input=false azurerm_storage_account.sa "/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/${{ secrets.AZURE_RESOURCE_GROUP }}/providers/Microsoft.Storage/storageAccounts/${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}"
+          fi
+
+      - name: Terraform Format & Validate
+        run: |
+          terraform fmt -check
+          terraform validate
+
+      - name: Terraform Plan
+        env:
+          ACCOUNT_KEY: ${{ env.ACCOUNT_KEY }}
+        run: terraform plan -input=false -out=tfplan
+
+      - name: Terraform Apply
+        run: terraform apply -input=false -auto-approve tfplan
