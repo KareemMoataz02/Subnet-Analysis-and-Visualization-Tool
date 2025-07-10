@@ -186,7 +186,3 @@ After provisioning, the state file in the Azure Blob container will be used by s
 │   └── test_visualize.py          # Unit tests for visualization
 └── README.md                      # This file
 ```
-
-## License
-
-This project is released under the MIT License.
