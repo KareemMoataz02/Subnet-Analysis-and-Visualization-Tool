@@ -100,6 +100,8 @@ A Dockerfile is included for an isolated environment.
 
 ### Build Docker Image
 
+The image **name** and **tag** (`subnet-analysis-tool`) is set by the `-t` flag in the build command—not in the Dockerfile itself.
+
 ```bash
 docker build -t subnet-analysis-tool .
 ```
@@ -160,6 +162,18 @@ terraform apply -auto-approve -var="..."
 ```
 
 After provisioning, the state file in the Azure Blob container will be used by subsequent runs.
+
+## Visuals
+
+### Network Visualization
+
+![Network Plot](network_plot.png)
+*Bar chart showing usable hosts per subnet.*
+
+### Cloud Architecture
+
+![Cloud Architecture](cloud_architecture.png)
+*Diagram of the Azure resources and Terraform-managed state backend.*
 
 ## File Structure
 
